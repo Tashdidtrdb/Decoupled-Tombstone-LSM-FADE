@@ -5,18 +5,31 @@ from stats import Stats
 
 DEBUG = False
 
+# Logical payload charged to ingest for one delete. put() charges only the value
+# payload (not the serialized record), so a delete is charged the equivalent unit:
+# the key identifying what to erase. Deletes are user work and must appear in the
+# WAF denominator, otherwise delete-heavy workloads look artificially amplified.
+TOMBSTONE_INGEST_BYTES = 8
+
 class LSM:
-	def __init__(self, data_dir, memtable_size=1000, num_levels=4, l0_capacity_bytes=1024*1024, stats=None, deadline=None):
+	def __init__(self, data_dir, memtable_size=1000, num_levels=4, l0_capacity_bytes=1024*1024, stats=None, deadline=None, tombstone_memtable_share=0.5):
 		os.makedirs(data_dir, exist_ok=True)
 		self.data_dir = data_dir
 		self.stats = stats or Stats()
 		self.seqnum = 0
 		self._file_counter = 0
 
+		# memtable_size is the TOTAL in-memory buffer budget, split across the two
+		# memtables. Giving each one the full budget would hand this engine 2x the
+		# memory of the vanilla single-memtable engine and make it flush at a
+		# different rate, so Vanilla vs Decoupled WAF would not be comparable.
+		self.tombstone_memtable_size = max(1, int(memtable_size * tombstone_memtable_share))
+		self.data_memtable_size = max(1, memtable_size - self.tombstone_memtable_size)
+
 		# Separate MemTables
-		self.data_memtable = MemTable(memtable_size, self.stats)
+		self.data_memtable = MemTable(self.data_memtable_size, self.stats)
 		# levels[0] = L0, files ordered newest first so get() finds highest seqnum first
-		self.tombstone_memtable = MemTable(memtable_size, self.stats)
+		self.tombstone_memtable = MemTable(self.tombstone_memtable_size, self.stats)
 
 		# Separate SST hierarchies
 		self.data_levels = [[] for _ in range(num_levels)]
@@ -73,6 +86,9 @@ class LSM:
 
 	def delete(self, key):
 		self.seqnum += 1
+		# a delete is user-issued work that causes real writes, so it must count
+		# toward ingest or WAF inflates purely because a workload deletes more
+		self.stats.record_ingest(TOMBSTONE_INGEST_BYTES)
 		self.tombstone_memtable.delete(key, self.seqnum)
 
 		if self.tombstone_memtable.is_full():
@@ -220,9 +236,11 @@ class LSM:
 			seen.add(rec.key)
 			merged.append(rec)
 
-		# Record this independently triggered compaction
+		# Record this independently triggered compaction. It is deadline-driven,
+		# so it counts as compliance work.
 		self.stats.record_compaction(
-			1 + len(overlapping_dst)
+			1 + len(overlapping_dst),
+			compliance=True
 		)
 
 		# Remove old tombstone SST files
@@ -247,7 +265,7 @@ class LSM:
 			)
 
 			new_sst.write()
-			self.stats.record_write(new_sst.size_bytes)
+			self.stats.record_write(new_sst.size_bytes, compliance=True)
 
 			dst_level.append(new_sst)
 			dst_level.sort(key=lambda sst: sst.min_key)

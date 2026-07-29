@@ -111,10 +111,11 @@ def experiment_vary_delete_ratio(deadline=200, num_ops=8000, key_space=500):
 		f = run_engine(ops, deadline=deadline)
 		overhead = f"{((f.waf() / v.waf() - 1) * 100):.0f}%"
 		rows.append([f"{int(dr*100)}%", f"{v.waf():.2f}", f"{f.waf():.2f}",
-			v.compaction_count, f.compaction_count, overhead])
+			v.compaction_count, f.compaction_count, overhead,
+			f"{f.compliance_waf():.2f}"])
 
 	print_table(rows, ["delete_ratio", "vanilla_WAF", "fade_WAF",
-		"vanilla_compact", "fade_compact", "FADE_overhead"])
+		"vanilla_compact", "fade_compact", "FADE_overhead", "fade_complianceWAF"])
 	print("\n  -> more deletes = more tombstones = more eager compactions triggered by FADE")
 	print("  -> overhead column shows how much extra write work FADE adds over vanilla")
 
@@ -132,9 +133,11 @@ def experiment_vary_skew(deadline=200, num_ops=8000, key_space=500, delete_ratio
 		v = run_engine(ops, deadline=None)
 		f = run_engine(ops, deadline=deadline)
 		rows.append([label, f"{v.waf():.2f}", f"{f.waf():.2f}",
-			v.compaction_count, f.compaction_count])
+			v.compaction_count, f.compaction_count,
+			f"{f.compliance_waf():.2f}"])
 
-	print_table(rows, ["key_skew", "vanilla_WAF", "fade_WAF", "vanilla_compact", "fade_compact"])
+	print_table(rows, ["key_skew", "vanilla_WAF", "fade_WAF", "vanilla_compact",
+		"fade_compact", "fade_complianceWAF"])
 	print("\n  -> uniform deletes spread across all keys, each compaction must merge more files")
 	print("  -> zipf concentrates deletes on hot keys, compactions stay more localized")
 
