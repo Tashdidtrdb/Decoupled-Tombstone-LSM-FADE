@@ -19,13 +19,15 @@ class Record:
 		return Record(d["key"], d["value"], d["seqnum"], d["type"])
 
 class SSTable:
-	def __init__(self, records, filepath):
+	def __init__(self, records, filepath, level_entry_seqnum=None):
 		# must pass records already sorted by key
 		self.records = records
 		self.filepath = filepath
 		self.min_key = records[0].key
 		self.max_key = records[-1].key
 		self.size_bytes = 0
+		# Logical time when this SST entered its current level
+		self.level_entry_seqnum = level_entry_seqnum
 		# seqnum of the oldest tombstone in this file, float("inf") if none
 		tombstone_seqnums = [r.seqnum for r in records if r.type == DELETE]
 		self.oldest_tombstone_time = min(tombstone_seqnums) if tombstone_seqnums else float("inf")
