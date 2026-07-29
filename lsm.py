@@ -280,16 +280,14 @@ class LSM:
 
 	def _maybe_compact_data(self):
 		# walk forward, re-checking each level until it's under capacity before advancing
+		# data compaction is capacity-driven only; tombstone TTL is handled by
+		# _maybe_compact_tombstones, which owns the tombstone hierarchy
 		i = 0
-		while i < len(self.levels) - 1:
+		while i < len(self.data_levels) - 1:
 			if self._level_bytes(i) > self.level_capacity[i]:
 				self._compact(i)
 			else:
-				expired = self._expired_tombstone_file(i)
-				if expired:
-					self._compact(i, src_file=expired)
-				else:
-					i += 1
+				i += 1
 
 	def _maybe_compact_tombstones(self):
 		# Vanilla mode has no delete-persistence deadline
