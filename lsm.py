@@ -2,6 +2,7 @@ import os
 from memtable import MemTable
 from sst import SSTable
 from stats import Stats
+from tombstone_index import TombstoneIndex
 
 DEBUG = False
 
@@ -12,7 +13,7 @@ DEBUG = False
 TOMBSTONE_INGEST_BYTES = 8
 
 class LSM:
-	def __init__(self, data_dir, memtable_size=1000, num_levels=4, l0_capacity_bytes=1024*1024, stats=None, deadline=None, tombstone_memtable_share=0.5):
+	def __init__(self, data_dir, memtable_size=1000, num_levels=4, l0_capacity_bytes=1024*1024, stats=None, deadline=None, tombstone_memtable_share=0.5, tombstone_filter_bits=None):
 		os.makedirs(data_dir, exist_ok=True)
 		self.data_dir = data_dir
 		self.stats = stats or Stats()
@@ -35,6 +36,10 @@ class LSM:
 		self.data_levels = [[] for _ in range(num_levels)]
 		# each level is 10x the capacity of the one above it
 		self.tombstone_levels = [[] for _ in range(num_levels)]
+		# Per-level membership filters over tombstone keys. A miss at every level
+		# proves no tombstone exists for a key, letting get() skip the whole
+		# tombstone hierarchy without opening a file.
+		self.tombstone_index = TombstoneIndex(num_levels, level_bits=tombstone_filter_bits)
 
 		# Temporary compatibility with existing compaction code.
 		# Will be removed after separate compaction is implemented.
@@ -71,9 +76,22 @@ class LSM:
 		)
 		sst.level_entry_seqnum = self.seqnum
 		self.tombstone_levels[0].insert(0, sst)
+		self._refresh_tombstone_index(0)
 
 		# Scheduler will be separated later
 		self._maybe_compact_tombstones()
+
+	def _refresh_tombstone_index(self, *level_idxs):
+		"""
+		Rebuild the filters for levels whose tombstone file set just changed.
+		Bloom filters cannot retract individual keys, so any change to a level's
+		contents requires rebuilding that level's filter from scratch.
+		"""
+		for level_idx in level_idxs:
+			self.tombstone_index.rebuild_level(
+				level_idx,
+				self.tombstone_levels[level_idx]
+			)
 
 	def put(self, key, value):
 		self.seqnum += 1
@@ -111,8 +129,18 @@ class LSM:
 				if newest_record is None or rec.seqnum > newest_record.seqnum:
 					newest_record = rec
 
-		# Check both data SSTs and tombstone SSTs
-		for levels in [self.data_levels, self.tombstone_levels]:
+		# Consult the tombstone registry once. A miss at every level is definitive:
+		# no tombstone exists for this key, so the entire tombstone hierarchy can be
+		# skipped without opening a file. A hit is not conclusive -- a key may be
+		# tombstoned and later re-inserted -- so the seqnum comparison below still
+		# decides which record wins.
+		search_spaces = [self.data_levels]
+		if self.tombstone_index.any_level_may_contain(key):
+			search_spaces.append(self.tombstone_levels)
+		else:
+			self.stats.record_tombstone_hierarchy_skip()
+
+		for levels in search_spaces:
 			for level in levels:
 				for sst in level:
 					if not (sst.min_key <= key <= sst.max_key):
@@ -288,6 +316,9 @@ class LSM:
 
 			dst_level.append(new_sst)
 			dst_level.sort(key=lambda sst: sst.min_key)
+
+		# both levels changed: tombstones left src_level and landed in dst_level
+		self._refresh_tombstone_index(level_idx, level_idx + 1)
 		if DEBUG:
 			print(
 					f"[TTL] Compacted tombstone SST "

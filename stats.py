@@ -17,6 +17,9 @@ class Stats:
 		self.filter_false_positives = 0  # filter said maybe, block did not hold the key
 		self.block_reads = 0  # blocks actually read off disk
 		self.block_bytes_read = 0  # bytes read, vs whole-file scans before
+		# lookups where the per-level tombstone filters ruled out the whole
+		# tombstone hierarchy, so no tombstone file was opened at all
+		self.tombstone_hierarchy_skips = 0
 
 	def record_write(self, byte_count, compliance=False):
 		self.bytes_written += byte_count
@@ -39,6 +42,9 @@ class Stats:
 
 	def record_filter_skip(self):
 		self.filter_skips += 1
+
+	def record_tombstone_hierarchy_skip(self):
+		self.tombstone_hierarchy_skips += 1
 
 	def record_false_positive(self):
 		self.filter_false_positives += 1
