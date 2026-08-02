@@ -12,8 +12,16 @@ DEBUG = False
 # WAF denominator, otherwise delete-heavy workloads look artificially amplified.
 TOMBSTONE_INGEST_BYTES = 8
 
+# Max records per compaction output file. Compaction merges its inputs into one
+# sorted run and then cuts it into files of this size, so each output file covers
+# a narrow, disjoint key range. Without the cut, one output file spans the union
+# of all input ranges and every later targeted rewrite degenerates into a full
+# rewrite. Smaller values sharpen targeting but multiply file count -- the
+# proposal flags file proliferation as a risk, so this is a tunable knob.
+DEFAULT_TARGET_FILE_RECORDS = 50
+
 class LSM:
-	def __init__(self, data_dir, memtable_size=1000, num_levels=4, l0_capacity_bytes=1024*1024, stats=None, deadline=None, tombstone_memtable_share=0.5, tombstone_filter_bits=None):
+	def __init__(self, data_dir, memtable_size=1000, num_levels=4, l0_capacity_bytes=1024*1024, stats=None, deadline=None, tombstone_memtable_share=0.5, tombstone_filter_bits=None, target_file_records=DEFAULT_TARGET_FILE_RECORDS):
 		os.makedirs(data_dir, exist_ok=True)
 		self.data_dir = data_dir
 		self.stats = stats or Stats()
@@ -45,6 +53,8 @@ class LSM:
 		# Will be removed after separate compaction is implemented.
 		self.levels = self.data_levels
 
+		# None disables splitting (one output file per compaction, the old behaviour)
+		self.target_file_records = target_file_records
 		self.level_capacity = [l0_capacity_bytes * (10 ** i) for i in range(num_levels)]
 		# deadline D in ops; per-level TTL is an even split so shallow levels flush tombstones faster
 		self.deadline = deadline
@@ -204,14 +214,24 @@ class LSM:
 			# capacity-driven: oldest in L0, first in L1+
 			src_file = src_level[-1] if level_idx == 0 else src_level[0]
 
-		overlapping_dst = [sst for sst in dst_level if src_file.overlaps(sst)]
-
 		# L0 files can overlap each other, so also pull in any L0 siblings that
 		# cover the same key range, otherwise a newer record in another L0 file
 		# could end up below a tombstone that was compacted without it
 		overlapping_src = []
 		if level_idx == 0:
 			overlapping_src = [sst for sst in src_level if sst is not src_file and src_file.overlaps(sst)]
+
+		# Destination files must be selected against the FULL key range being
+		# merged, not against src_file alone. L0 siblings can widen that range
+		# beyond src_file, and a dst file inside the widened span but outside
+		# src_file would survive while the output covers its keys, leaving two
+		# files at the same level claiming the same key.
+		merge_min = min([src_file.min_key] + [s.min_key for s in overlapping_src])
+		merge_max = max([src_file.max_key] + [s.max_key for s in overlapping_src])
+		overlapping_dst = [
+			sst for sst in dst_level
+			if sst.min_key <= merge_max and sst.max_key >= merge_min
+		]
 
 		all_records = list(src_file.records)
 		for sst in overlapping_src + overlapping_dst:
@@ -241,13 +261,36 @@ class LSM:
 				dst_level.remove(sst)
 			os.remove(sst.filepath)
 
-		if merged:
-			new_sst = SSTable(merged, self._new_path("data"))
+		# Split the merged output into several key-disjoint files rather than one
+		# file spanning everything. A single output file would cover the union of
+		# every input range, so every subsequent compliance rewrite would have to
+		# touch it. Narrow files are what let a targeted rewrite stay targeted.
+		#
+		# Any dst file inside the merged key range was pulled into this merge, so
+		# the runs below cannot collide with a survivor.
+		for run in self._split_into_runs(merged):
+			new_sst = SSTable(run, self._new_path("data"))
 			new_sst.write()
 			self.stats.record_write(new_sst.size_bytes)
 			dst_level.append(new_sst)
-			# keep L1+ sorted by key range so get() scans stay correct
-			dst_level.sort(key=lambda s: s.min_key)
+
+		# keep L1+ sorted by key range so get() scans stay correct
+		dst_level.sort(key=lambda s: s.min_key)
+
+	def _split_into_runs(self, records):
+		"""
+		Chop a sorted record list into consecutive runs of at most
+		target_file_records. Records are already key-sorted and deduplicated, so
+		consecutive runs have strictly disjoint key ranges.
+		"""
+		if not records:
+			return []
+		if not self.target_file_records:
+			return [records]
+		return [
+			records[i:i + self.target_file_records]
+			for i in range(0, len(records), self.target_file_records)
+		]
 	def _compact_tombstones(self, level_idx, expired_sst):
 		"""
 		Compliance-driven tombstone compaction.
