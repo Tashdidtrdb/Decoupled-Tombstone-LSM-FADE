@@ -115,18 +115,37 @@ class LSM:
 		for levels in [self.data_levels, self.tombstone_levels]:
 			for level in levels:
 				for sst in level:
-					if sst.min_key <= key <= sst.max_key:
-						files_touched += 1
+					if not (sst.min_key <= key <= sst.max_key):
+						continue
 
-						for rec in sst.records:
-							if rec.key == key:
-								if (
-									newest_record is None
-									or rec.seqnum > newest_record.seqnum
-								):
-									newest_record = rec
+					# Range says maybe; the filter is what rules the file out.
+					# A negative here costs no I/O at all.
+					if not sst.bloom.contains(key):
+						self.stats.record_filter_skip()
+						continue
 
-								break
+					# Filter says probably present, so pay for exactly one block
+					# instead of scanning the whole file.
+					block = sst.find_block(key)
+					if block is None:
+						self.stats.record_filter_skip()
+						continue
+
+					files_touched += 1
+					self.stats.record_block_read(block.num_bytes)
+
+					for rec in sst.read_block(block):
+						if rec.key == key:
+							if (
+								newest_record is None
+								or rec.seqnum > newest_record.seqnum
+							):
+								newest_record = rec
+
+							break
+					else:
+						# filter said maybe but the block did not hold it
+						self.stats.record_false_positive()
 
 		self.stats.record_lookup(files_touched)
 
