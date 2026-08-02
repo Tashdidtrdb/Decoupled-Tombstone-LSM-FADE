@@ -32,8 +32,10 @@ for filename in sorted(os.listdir(TEST_DIR)):
 
     filepath = os.path.join(TEST_DIR, filename)
 
+    # SSTs are line-delimited JSON (one record per line) so blocks can be read
+    # by byte offset without parsing the whole file
     with open(filepath, "r") as file:
-        records = json.load(file)
+        records = [json.loads(line) for line in file if line.strip()]
 
     record_types = [record["type"] for record in records]
     print("  Record types:", record_types)
