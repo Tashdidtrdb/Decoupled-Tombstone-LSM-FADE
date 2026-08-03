@@ -53,8 +53,8 @@ def test_get_across_flushed_l0():
 	for i in range(50):
 		assert db.get(i) == f"val{i}", f"missing key {i}"
 
-	assert len(db.levels[0]) > 1, "expected multiple L0 files"
-	print(f"A3 pass -- get across {len(db.levels[0])} L0 files ok")
+	assert len(db.data_levels[0]) > 1, "expected multiple L0 files"
+	print(f"A3 pass -- get across {len(db.data_levels[0])} L0 files ok")
 	cleanup()
 
 def test_update_overwrites():

@@ -56,8 +56,8 @@ def test_tombstone_seqnum_matches_delete_seqnum():
 	seqnum_before_delete = db.seqnum
 	db.delete(1)
 	expected_seqnum = seqnum_before_delete + 1
-	# tombstone is in memtable now
-	rec = db.memtable.data[1]
+	# deletes are routed to the dedicated tombstone memtable, not the data one
+	rec = db.tombstone_memtable.data[1]
 	assert rec.type == DELETE
 	assert rec.seqnum == expected_seqnum, f"expected seqnum {expected_seqnum}, got {rec.seqnum}"
 	print(f"B1 pass -- tombstone seqnum = {rec.seqnum}, matches logical clock")

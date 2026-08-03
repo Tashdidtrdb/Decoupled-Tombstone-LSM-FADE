@@ -58,14 +58,9 @@ class LSM:
 		# tombstone hierarchy without opening a file.
 		self.tombstone_index = TombstoneIndex(num_levels, level_bits=tombstone_filter_bits)
 
-		# Temporary compatibility with existing compaction code.
-		# Will be removed after separate compaction is implemented.
-		self.levels = self.data_levels
-
 		# None disables splitting (one output file per compaction, the old behaviour)
 		self.target_file_records = target_file_records
 		self.level_capacity = [l0_capacity_bytes * (10 ** i) for i in range(num_levels)]
-		# deadline D in ops; per-level TTL is an even split so shallow levels flush tombstones faster
 		self.deadline = deadline
 		# mode defaults from the deadline so existing callers keep working:
 		# no deadline means vanilla, a deadline means the decoupled design
@@ -76,9 +71,17 @@ class LSM:
 		if mode != MODE_VANILLA and deadline is None:
 			raise ValueError(f"mode {mode!r} requires a deadline")
 		self.mode = mode
-		# cumulative TTL: level i fires when tombstone age > (i+1) * (D/L)
-		# this gives each level a D/L window before cascading the tombstone further down
-		self.level_ttl = [(i + 1) * (deadline // num_levels) for i in range(num_levels)] if deadline else None
+		# Each level gets D/L of the deadline, measured from when a file entered
+		# that level. Crossing all L levels therefore costs at most D operations,
+		# making the deadline an end-to-end guarantee.
+		self.per_level_ttl = max(1, deadline // num_levels) if deadline else None
+		# Cumulative view of the same policy: the age, measured from tombstone
+		# creation, by which a tombstone should have left level i. Reported for
+		# analysis; the scheduler uses per_level_ttl above.
+		self.level_ttl = (
+			[(i + 1) * self.per_level_ttl for i in range(num_levels)]
+			if deadline else None
+		)
 
 	def _new_path(self, prefix):
 		path = os.path.join(
@@ -94,7 +97,7 @@ class LSM:
 		)
 		self.data_levels[0].insert(0, sst)
 
-		# For now keep the existing scheduler
+		# capacity-driven only; tombstone deadlines are a separate schedule
 		self._maybe_compact_data()
 
 
@@ -106,7 +109,7 @@ class LSM:
 		self.tombstone_levels[0].insert(0, sst)
 		self._refresh_tombstone_index(0)
 
-		# Scheduler will be separated later
+		# deadline-driven; runs independently of capacity compaction
 		self._maybe_compact_tombstones()
 
 	def _refresh_tombstone_index(self, *level_idxs):
@@ -222,11 +225,11 @@ class LSM:
 			self._flush_tombstone_memtable()
 
 	def _level_bytes(self, level_idx):
-		return sum(sst.size_bytes for sst in self.levels[level_idx])
+		return sum(sst.size_bytes for sst in self.data_levels[level_idx])
 
 	def _compact(self, level_idx, src_file=None):
-		src_level = self.levels[level_idx]
-		dst_level = self.levels[level_idx + 1]
+		src_level = self.data_levels[level_idx]
+		dst_level = self.data_levels[level_idx + 1]
 
 		if src_file is None:
 			# capacity-driven: oldest in L0, first in L1+
@@ -258,7 +261,7 @@ class LSM:
 		# sort by key asc, seqnum desc so highest seqnum per key comes first
 		all_records.sort(key=lambda r: (r.key, -r.seqnum))
 
-		is_bottom = (level_idx + 1 == len(self.levels) - 1)
+		is_bottom = (level_idx + 1 == len(self.data_levels) - 1)
 		merged = []
 		seen = set()
 		for rec in all_records:
@@ -496,100 +499,25 @@ class LSM:
 			self.stats.record_tombstone_retired()
 		self._retire_tombstone_file(level_idx, expired_sst, survivors)
 
-	def _compact_tombstones(self, level_idx, expired_sst):
-		"""
-		Compliance-driven tombstone compaction.
-
-		Compacts only tombstone SST files. It does not perform
-		normal capacity-driven data compaction.
-		"""
-		src_level = self.tombstone_levels[level_idx]
-		dst_level = self.tombstone_levels[level_idx + 1]
-
-		# Find tombstone SSTs in the next level with overlapping key ranges
-		overlapping_dst = [
-			sst for sst in dst_level
-			if expired_sst.overlaps(sst)
-		]
-
-		# Collect records only from tombstone files
-		all_records = list(expired_sst.records)
-
-		for sst in overlapping_dst:
-			all_records.extend(sst.records)
-
-		# Newest tombstone for each key must win
-		all_records.sort(key=lambda r: (r.key, -r.seqnum))
-
-		merged = []
-		seen = set()
-
-		for rec in all_records:
-			if rec.key in seen:
-				continue
-
-			seen.add(rec.key)
-			merged.append(rec)
-
-		# Record this independently triggered compaction. It is deadline-driven,
-		# so it counts as compliance work.
-		self.stats.record_compaction(
-			1 + len(overlapping_dst),
-			compliance=True
-		)
-
-		# Remove old tombstone SST files
-		input_files = [expired_sst] + overlapping_dst
-
-		for sst in input_files:
-			if sst in src_level:
-				src_level.remove(sst)
-
-			if sst in dst_level:
-				dst_level.remove(sst)
-
-			if os.path.exists(sst.filepath):
-				os.remove(sst.filepath)
-
-		# Write a new dedicated tombstone SST
-		if merged:
-			new_sst = SSTable(
-				merged,
-				self._new_path("tombstone"),
-				level_entry_seqnum=self.seqnum
-			)
-
-			new_sst.write()
-			self.stats.record_write(new_sst.size_bytes, compliance=True)
-
-			dst_level.append(new_sst)
-			dst_level.sort(key=lambda sst: sst.min_key)
-
-		# both levels changed: tombstones left src_level and landed in dst_level
-		self._refresh_tombstone_index(level_idx, level_idx + 1)
-		if DEBUG:
-			print(
-					f"[TTL] Compacted tombstone SST "
-					f"L{level_idx} -> L{level_idx + 1}"
-				)
-
 	def _expired_tombstone_file(self, level_idx):
-		if not self.level_ttl:
+		"""
+		First tombstone file at this level that has outlived its share of the
+		deadline.
+
+		Age is measured from when the file entered its current level, and each
+		level is allowed D/L of the total deadline. A tombstone therefore has at
+		most D operations to traverse all L levels, which is what makes D an
+		end-to-end guarantee rather than a per-level one.
+		"""
+		if self.deadline is None:
 			return None
 
 		for sst in self.tombstone_levels[level_idx]:
 			if sst.level_entry_seqnum is None:
 				sst.level_entry_seqnum = self.seqnum
 
-			# Each level receives its own portion of the total deadline
-			per_level_ttl = max(
-				1,
-				self.deadline // len(self.tombstone_levels)
-			)
-
 			age_in_level = self.seqnum - sst.level_entry_seqnum
-
-			if age_in_level > per_level_ttl:
+			if age_in_level > self.per_level_ttl:
 				return sst
 
 		return None

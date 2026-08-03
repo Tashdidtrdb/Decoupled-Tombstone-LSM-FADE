@@ -88,7 +88,7 @@ def test_tombstone_dropped_at_bottom():
 	# key should be gone
 	assert db.get(99) is None
 	# check that no tombstone record for key 99 survives in the bottom level
-	bottom = db.levels[-1]
+	bottom = db.data_levels[-1]
 	for sst in bottom:
 		for rec in sst.records:
 			assert not (rec.key == 99 and rec.type == "DELETE"), "tombstone survived at bottom level"
