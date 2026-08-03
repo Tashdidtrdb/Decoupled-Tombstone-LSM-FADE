@@ -1,6 +1,7 @@
 import os
 from memtable import MemTable
 from sst import SSTable
+from planner import plan_purge
 from stats import Stats
 from tombstone_index import TombstoneIndex
 
@@ -20,8 +21,16 @@ TOMBSTONE_INGEST_BYTES = 8
 # proposal flags file proliferation as a risk, so this is a tunable knob.
 DEFAULT_TARGET_FILE_RECORDS = 50
 
+# Compliance strategies compared in the evaluation.
+#   vanilla   -- no deadline; tombstones propagate lazily via capacity compaction
+#   fade      -- deadline met by a wide merge of every range-overlapping data file
+#   decoupled -- deadline met by rewriting only the files that hold a deleted key
+MODE_VANILLA = "vanilla"
+MODE_FADE = "fade"
+MODE_DECOUPLED = "decoupled"
+
 class LSM:
-	def __init__(self, data_dir, memtable_size=1000, num_levels=4, l0_capacity_bytes=1024*1024, stats=None, deadline=None, tombstone_memtable_share=0.5, tombstone_filter_bits=None, target_file_records=DEFAULT_TARGET_FILE_RECORDS):
+	def __init__(self, data_dir, memtable_size=1000, num_levels=4, l0_capacity_bytes=1024*1024, stats=None, deadline=None, tombstone_memtable_share=0.5, tombstone_filter_bits=None, target_file_records=DEFAULT_TARGET_FILE_RECORDS, mode=None):
 		os.makedirs(data_dir, exist_ok=True)
 		self.data_dir = data_dir
 		self.stats = stats or Stats()
@@ -58,6 +67,15 @@ class LSM:
 		self.level_capacity = [l0_capacity_bytes * (10 ** i) for i in range(num_levels)]
 		# deadline D in ops; per-level TTL is an even split so shallow levels flush tombstones faster
 		self.deadline = deadline
+		# mode defaults from the deadline so existing callers keep working:
+		# no deadline means vanilla, a deadline means the decoupled design
+		if mode is None:
+			mode = MODE_VANILLA if deadline is None else MODE_DECOUPLED
+		if mode not in (MODE_VANILLA, MODE_FADE, MODE_DECOUPLED):
+			raise ValueError(f"unknown mode: {mode}")
+		if mode != MODE_VANILLA and deadline is None:
+			raise ValueError(f"mode {mode!r} requires a deadline")
+		self.mode = mode
 		# cumulative TTL: level i fires when tombstone age > (i+1) * (D/L)
 		# this gives each level a D/L window before cascading the tombstone further down
 		self.level_ttl = [(i + 1) * (deadline // num_levels) for i in range(num_levels)] if deadline else None
@@ -291,6 +309,193 @@ class LSM:
 			records[i:i + self.target_file_records]
 			for i in range(0, len(records), self.target_file_records)
 		]
+	def _scrub_file(self, sst, keys, cutoff):
+		"""
+		Fetch one data file, drop every record invalidated by an expiring
+		tombstone, and rewrite it. This is the "fetch-drop-rewrite" step: the file
+		was chosen by probing per-file Bloom filters, so it is one of the few that
+		actually houses a deleted record rather than every file whose key range
+		happens to overlap.
+
+		Only records older than their tombstone are dropped. A key that was deleted
+		and later re-inserted has a newer PUT that must survive.
+		"""
+		level_idx = self._level_of(sst)
+		if level_idx is None:
+			return False
+
+		kept = [
+			rec for rec in sst.records
+			if not (rec.key in keys and rec.seqnum < cutoff.get(rec.key, 0))
+		]
+		if len(kept) == len(sst.records):
+			# every candidate was a filter false positive: nothing to erase here
+			return False
+
+		self.data_levels[level_idx].remove(sst)
+		if os.path.exists(sst.filepath):
+			os.remove(sst.filepath)
+
+		# rewriting the scrubbed file is the cost of meeting the deadline
+		self.stats.record_compaction(1, compliance=True)
+		if kept:
+			new_sst = SSTable(kept, self._new_path("data"))
+			new_sst.write()
+			self.stats.record_write(new_sst.size_bytes, compliance=True)
+			self.data_levels[level_idx].append(new_sst)
+
+		if level_idx > 0:
+			self.data_levels[level_idx].sort(key=lambda s: s.min_key)
+		return True
+
+	def _level_of(self, sst):
+		for level_idx, level in enumerate(self.data_levels):
+			if sst in level:
+				return level_idx
+		return None
+
+	def _purge_expired_tombstones(self, level_idx, expired_sst):
+		"""
+		Honour the delete deadline for one expired tombstone file.
+
+		Each tombstone is applied to the data hierarchy individually. Batching a
+		whole file's keys into one plan would select nearly every data file --
+		hundreds of scattered keys collectively span the keyspace -- which is
+		exactly the wide-merge behaviour this design replaces. Per-key purging is
+		what keeps the blast radius to a single file.
+
+		A tombstone is retired once its key is confirmed gone from the data
+		hierarchy; nothing older can resurface, so the marker has no further work
+		to do. Tombstones that still shadow live data are kept and cascade to the
+		next level as before.
+		"""
+		# Plan per key so targeting stays narrow, but group the rewrites by file:
+		# a file holding twenty tombstoned keys must be rewritten once, not twenty
+		# times. Planning granularity controls the blast radius; rewrite grouping
+		# controls how often each file in that radius is paid for.
+		cutoff = {}
+		targets = {}
+		for rec in expired_sst.records:
+			plan = plan_purge([rec.key], self.data_levels, self.stats)
+			cutoff[rec.key] = max(cutoff.get(rec.key, 0), rec.seqnum)
+			for sst in plan.files:
+				targets.setdefault(id(sst), (sst, set()))[1].add(rec.key)
+
+		for sst, keys in targets.values():
+			self._scrub_file(sst, keys, cutoff)
+
+		survivors = [
+			rec for rec in sorted(expired_sst.records, key=lambda r: r.key)
+			if self._tombstone_still_needed(rec.key, rec.seqnum)
+		]
+		for _ in range(len(expired_sst.records) - len(survivors)):
+			self.stats.record_tombstone_retired()
+
+		self._retire_tombstone_file(level_idx, expired_sst, survivors)
+
+	def _tombstone_still_needed(self, key, tombstone_seqnum):
+		"""
+		A tombstone may only be dropped once it can no longer affect a read.
+
+		Two reasons to keep it:
+		  - an older record survives somewhere, so the tombstone is still shadowing
+		    data that has not been erased yet
+		  - a newer record exists for the key, in which case this tombstone is no
+		    longer the newest version but is still part of the version chain that
+		    a later purge must reason about
+
+		Only when no record for the key remains at all is the marker truly spent.
+		Dropping it while a newer PUT exists would be harmless for that PUT, but
+		dropping it while it is the newest version would resurrect deleted data.
+
+		The memtable counts. A purge only scrubs on-disk files, so an unflushed
+		record is invisible to the planner; retiring the tombstone here would let
+		that record reach disk with nothing left to shadow it.
+		"""
+		if key in self.data_memtable.data:
+			return True
+
+		for level in self.data_levels:
+			for sst in level:
+				if not sst.may_contain(key):
+					continue
+				for rec in sst.records:
+					if rec.key == key:
+						return True
+		return False
+
+	def _retire_tombstone_file(self, level_idx, expired_sst, survivors):
+		"""
+		Drop a spent tombstone file. Any tombstone whose data has not yet been
+		fully erased is rewritten one level down so it keeps shadowing until the
+		purge completes.
+		"""
+		src_level = self.tombstone_levels[level_idx]
+		if expired_sst in src_level:
+			src_level.remove(expired_sst)
+		if os.path.exists(expired_sst.filepath):
+			os.remove(expired_sst.filepath)
+
+		refreshed = [level_idx]
+		if survivors:
+			dst_idx = min(level_idx + 1, len(self.tombstone_levels) - 1)
+			dst_level = self.tombstone_levels[dst_idx]
+			new_sst = SSTable(
+				survivors,
+				self._new_path("tombstone"),
+				level_entry_seqnum=self.seqnum
+			)
+			new_sst.write()
+			self.stats.record_write(new_sst.size_bytes, compliance=True)
+			self.stats.record_compaction(1, compliance=True)
+			dst_level.append(new_sst)
+			dst_level.sort(key=lambda s: s.min_key)
+			refreshed.append(dst_idx)
+
+		self._refresh_tombstone_index(*set(refreshed))
+
+	def _fade_merge(self, level_idx, expired_sst):
+		"""
+		FADE-style compliance compaction: the control we are measuring against.
+
+		Selects data files by key-range overlap with the expiring tombstone file
+		and rewrites every one of them. That is the wide-scope merge the decoupled
+		design replaces -- most selected files hold none of the deleted keys but
+		are rewritten anyway because their range happens to span the tombstone.
+
+		Erases the same records as the targeted path, so both modes meet the same
+		deadline and only the cost differs.
+		"""
+		keys = {rec.key: rec.seqnum for rec in expired_sst.records}
+		lo, hi = min(keys), max(keys)
+
+		for data_level_idx, level in enumerate(self.data_levels):
+			for sst in [s for s in level if s.min_key <= hi and s.max_key >= lo]:
+				kept = [
+					rec for rec in sst.records
+					if not (rec.key in keys and rec.seqnum < keys[rec.key])
+				]
+				level.remove(sst)
+				if os.path.exists(sst.filepath):
+					os.remove(sst.filepath)
+
+				self.stats.record_compaction(1, compliance=True)
+				if kept:
+					new_sst = SSTable(kept, self._new_path("data"))
+					new_sst.write()
+					self.stats.record_write(new_sst.size_bytes, compliance=True)
+					level.append(new_sst)
+			if data_level_idx > 0:
+				level.sort(key=lambda s: s.min_key)
+
+		survivors = [
+			rec for rec in sorted(expired_sst.records, key=lambda r: r.key)
+			if self._tombstone_still_needed(rec.key, rec.seqnum)
+		]
+		for _ in range(len(expired_sst.records) - len(survivors)):
+			self.stats.record_tombstone_retired()
+		self._retire_tombstone_file(level_idx, expired_sst, survivors)
+
 	def _compact_tombstones(self, level_idx, expired_sst):
 		"""
 		Compliance-driven tombstone compaction.
@@ -412,7 +617,7 @@ class LSM:
 				if expired is None:
 					break
 
-				self._compact_tombstones(
-					level_idx,
-					expired
-				)
+				if self.mode == MODE_FADE:
+					self._fade_merge(level_idx, expired)
+				else:
+					self._purge_expired_tombstones(level_idx, expired)

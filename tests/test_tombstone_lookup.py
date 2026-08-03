@@ -62,8 +62,9 @@ def test_hierarchy_skipped_when_no_tombstone():
 
 
 def test_index_updated_after_compaction():
-	# tombstones move between levels on TTL expiry; the filters must follow them
-	# or a lookup would miss a tombstone that is still live
+	# Tombstones move between levels on TTL expiry, and are retired once their key
+	# is physically erased. Either way the filters must stay consistent with the
+	# files actually resident, and the key must stay invisible.
 	db, stats = _engine(deadline=100, memtable_size=8)
 	for i in range(50):
 		db.put(i, "v" * 10)
@@ -72,10 +73,24 @@ def test_index_updated_after_compaction():
 	for i in range(1000, 1400):  # drive the clock so TTLs expire and cascade
 		db.put(i, "v")
 	db.flush()
+
+	# whatever the filters claim must match the tombstone files that exist
+	resident = {
+		rec.key
+		for level in db.tombstone_levels for sst in level for rec in sst.records
+	}
+	for key in resident:
+		assert db.tombstone_index.any_level_may_contain(key), \
+			f"tombstone {key} is on disk but missing from the index"
+
+	# and the deletes must still hold, whether via a surviving tombstone or
+	# because the record was physically purged
 	for i in range(0, 50, 2):
-		assert db.tombstone_index.any_level_may_contain(i), f"tombstone {i} lost from index"
 		assert db.get(i) is None, f"deleted key {i} resurfaced after compaction"
-	print("tslookup pass -- filters track tombstones across level compaction")
+	for i in range(1, 50, 2):
+		assert db.get(i) == "v" * 10, f"live key {i} was lost"
+	print(f"tslookup pass -- index consistent with {len(resident)} resident tombstones, "
+		f"{stats.tombstones_retired} retired after purge")
 
 
 def test_matches_reference_under_workload():

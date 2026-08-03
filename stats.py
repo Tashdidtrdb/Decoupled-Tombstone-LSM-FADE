@@ -20,6 +20,14 @@ class Stats:
 		# lookups where the per-level tombstone filters ruled out the whole
 		# tombstone hierarchy, so no tombstone file was opened at all
 		self.tombstone_hierarchy_skips = 0
+		# targeted purge planning: how often the planner ran, how many candidate
+		# files it probed, and how many the per-file filters ruled out
+		self.purge_plans = 0
+		self.purge_files_probed = 0
+		self.purge_filter_rejections = 0
+		# tombstones dropped after their key was confirmed erased from the data
+		# hierarchy; without this they would accumulate without bound
+		self.tombstones_retired = 0
 
 	def record_write(self, byte_count, compliance=False):
 		self.bytes_written += byte_count
@@ -45,6 +53,14 @@ class Stats:
 
 	def record_tombstone_hierarchy_skip(self):
 		self.tombstone_hierarchy_skips += 1
+
+	def record_tombstone_retired(self):
+		self.tombstones_retired += 1
+
+	def record_purge_planning(self, probed_files, filter_rejections):
+		self.purge_plans += 1
+		self.purge_files_probed += probed_files
+		self.purge_filter_rejections += filter_rejections
 
 	def record_false_positive(self):
 		self.filter_false_positives += 1
