@@ -131,6 +131,10 @@ class LSM:
 
 		if self.data_memtable.is_full():
 			self._flush_data_memtable()
+		# puts advance the logical clock too, so a buffered tombstone can age past
+		# its deadline during a run of writes with no deletes at all
+		if self._tombstone_memtable_is_stale():
+			self._flush_tombstone_memtable()
 		self._maybe_compact_tombstones()
 
 	def delete(self, key):
@@ -140,9 +144,26 @@ class LSM:
 		self.stats.record_ingest(TOMBSTONE_INGEST_BYTES)
 		self.tombstone_memtable.delete(key, self.seqnum)
 
-		if self.tombstone_memtable.is_full():
+		if self.tombstone_memtable.is_full() or self._tombstone_memtable_is_stale():
 			self._flush_tombstone_memtable()
 		self._maybe_compact_tombstones()
+
+	def _tombstone_memtable_is_stale(self):
+		"""
+		True once the oldest buffered tombstone has waited its share of the
+		deadline.
+
+		The TTL clock only starts when a tombstone reaches disk, so a tombstone
+		sitting in a slowly-filling memtable is invisible to the scheduler. Under
+		a delete-light workload it can outlive the whole deadline before the
+		buffer fills. Flushing on age as well as on capacity closes that gap, so
+		the deadline covers a tombstone's entire life rather than only its
+		on-disk life.
+		"""
+		if self.deadline is None or not self.tombstone_memtable.data:
+			return False
+		oldest = min(rec.seqnum for rec in self.tombstone_memtable.data.values())
+		return self.seqnum - oldest >= self.per_level_ttl
 
 	def get(self, key):
 		"""
