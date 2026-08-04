@@ -129,9 +129,9 @@ keeps benchmark runs reproducible in a way wall-clock timing would not.
 The `tick` command exists because of this — it issues throwaway writes (on keys from 900000
 up, well clear of any demo data) so you can advance the clock on demand.
 
-A wall-clock version is scoped in `CHECKPOINT.md` as future work. It would also require
-either a background thread or an explicit `maintain()` call to drive expiry during idle
-periods, which the deliberately single-threaded design avoids.
+A wall-clock version is future work. It would also require either a background thread or an
+explicit `maintain()` call to drive expiry during idle periods, which the deliberately
+single-threaded design avoids.
 
 ---
 
@@ -218,5 +218,5 @@ with `python3 evaluation.py`.
 | `shell.py` | interactive demo shell |
 | `tests/` | 24 test modules |
 
-`OVERVIEW.md` describes the architecture in detail. `CHECKPOINT.md` records project status,
-design decisions, and the findings that shaped the implementation.
+`OVERVIEW.md` describes the architecture in detail, including the design decisions and the
+findings that shaped the implementation.
