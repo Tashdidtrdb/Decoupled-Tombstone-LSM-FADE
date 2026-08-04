@@ -1,0 +1,8 @@
+# Runtime dependencies for the decoupled tombstone LSM engine.
+#
+# numpy is used only by workload.py, the original midterm workload generator,
+# which is kept so that run.py still works. The engine itself, the YCSB
+# generator in ycsb.py, the evaluation and the test suite all run on the
+# standard library alone.
+
+numpy>=1.20
