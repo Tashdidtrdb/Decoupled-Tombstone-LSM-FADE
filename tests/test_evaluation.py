@@ -36,6 +36,18 @@ def test_headline_claim_holds():
 	print(f"eval pass -- decoupled writes {saving:.0f}% less compliance data, both compliant")
 
 
+def test_vanilla_is_scored_against_the_same_deadline():
+	# Vanilla runs with deadline=None, so judging it by its own configuration
+	# would report zero violations by definition and hide the motivating problem.
+	# compare_modes must score every mode against the comparison's deadline.
+	vanilla, fade, decoupled = compare_modes(_ops(), deadline=DEADLINE)
+	assert vanilla.violations > 0, \
+		"vanilla reported zero violations -- it is not being scored against the deadline"
+	assert fade.violations == 0 and decoupled.violations == 0
+	print(f"eval pass -- vanilla misses the deadline on {vanilla.violations} records; "
+		f"both deadline modes miss none")
+
+
 def test_saving_holds_across_delete_ratios():
 	for workload in ["X-light", "X", "X-heavy"]:
 		_, fade, decoupled = compare_modes(_ops(workload=workload), deadline=DEADLINE)
@@ -97,6 +109,7 @@ def test_compliance_costs_more_lookup_io():
 
 if __name__ == "__main__":
 	test_headline_claim_holds()
+	test_vanilla_is_scored_against_the_same_deadline()
 	test_saving_holds_across_delete_ratios()
 	test_saving_holds_across_distributions()
 	test_uniform_is_the_worst_case_for_range_selection()
