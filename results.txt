@@ -1,0 +1,79 @@
+Decoupled Tombstone Storage: Three-Way Evaluation
+Vanilla LSM  vs  FADE (wide merge)  vs  Decoupled (targeted rewrite)
+engine: 4 levels, leveled compaction, logical op-counter clock
+
+==========================================================================
+  Experiment 1: Vanilla vs FADE vs Decoupled
+  YCSB workload X (30% read / 45% update / 25% delete), zipfian keys, D=500
+==========================================================================
+  9000 ops over 1000 keys (4616 puts, 2356 gets, 2028 deletes)
+
+config           WAF    compliance_WAF  compl_compactions  bytes/event  violations  lookup_IO  files
+---------------  -----  --------------  -----------------  -----------  ----------  ---------  -----
+Vanilla          5.55   0.00            0                  0            225         4.24       36   
+FADE D=500       54.61  49.92           1534               3532         0           7.02       65   
+Decoupled D=500  23.82  18.92           603                3405         0           7.03       68   
+
+  -> Decoupled writes 62% less compliance data than FADE
+  -> and runs 61% fewer compliance compactions
+  -> both deadline modes meet it (0 and 0 violations)
+  -> Vanilla does no compliance work, and misses the same deadline on 225 records
+  -> the cost: honouring a deadline leaves more, smaller files on disk
+     (36 -> 68), raising lookup I/O from 4.24 to 7.03 files per get
+
+==========================================================================
+  Experiment 2: Delete ratio vs compliance cost
+  How compliance cost scales with delete volume, D=500
+==========================================================================
+  zipfian keys, workload mix varies by delete ratio
+
+delete_ratio  vanilla_WAF  fade_complWAF  decoupled_complWAF  saving  violations V/F/D
+------------  -----------  -------------  ------------------  ------  ----------------
+5%            5.64         36.78          10.12               72%     42/0/0          
+25%           5.55         49.92          18.92               62%     225/0/0         
+40%           5.65         50.77          21.02               59%     323/0/0         
+
+  -> compliance cost rises with delete volume for both designs
+  -> the decoupled saving holds across the range
+
+==========================================================================
+  Experiment 3: Key distribution vs compliance cost
+  Where FADE's wide merge hurts most, D=500
+==========================================================================
+  workload X (25% deletes), 8000 ops
+
+distribution  vanilla_WAF  fade_complWAF  decoupled_complWAF  saving  violations V/F/D
+------------  -----------  -------------  ------------------  ------  ----------------
+zipfian       5.55         49.92          18.92               62%     225/0/0         
+latest        5.92         50.99          19.36               62%     229/0/0         
+uniform       9.44         72.23          24.91               66%     221/0/0         
+
+  -> skewed deletes concentrate on few files, so both designs stay cheap
+  -> uniform deletes spread across the key space: FADE's range-based
+     selection pulls in files holding none of the deleted keys, which
+     is exactly what per-key targeting avoids
+
+==========================================================================
+  Experiment 4: Output file size vs targeting
+  Smaller compaction output sharpens targeting but multiplies file count
+==========================================================================
+  decoupled mode only, uniform keys, D=500
+
+records/file  compliance_WAF  bytes/event  files_on_disk  lookup_IO  violations
+------------  --------------  -----------  -------------  ---------  ----------
+unsplit       28.19           8499         51             1.23       0         
+200           27.70           6241         54             1.23       0         
+100           27.12           4879         57             1.23       0         
+50            24.91           3346         64             1.22       0         
+25            20.51           2213         78             1.23       0         
+
+  -> unsplit output spans the whole key range, so every compliance
+     rewrite touches most of the data
+  -> smaller files narrow the blast radius, at the cost of more files
+     to track; the proposal flags file proliferation as a risk, and this
+     is the trade-off curve for choosing an operating point
+
+==========================================================================
+  evaluation complete
+==========================================================================
+

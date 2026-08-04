@@ -1,0 +1,54 @@
+# Presentation demo: deleted data that is not actually deleted.
+#
+# Run with:  python3 shell.py --script demo.txt
+# Or paste the commands one at a time into `python3 shell.py`.
+#
+# The same commands run twice, once per mode. Only the mode differs.
+
+# ---------------------------------------------------------------- vanilla LSM
+mode vanilla --force
+
+put 1 alice
+put 2 bob
+put 3 carol
+put 4 dave
+
+delete 2
+
+# The API says the record is gone.
+get 2
+
+# But it is still sitting in a file on disk.
+leaked
+
+# Let time pass. Nothing changes: vanilla has no deadline, so the record
+# stays until some unrelated compaction happens to rewrite that file.
+tick 5
+leaked
+
+# ------------------------------------------------------------ decoupled design
+mode decoupled --force
+
+put 1 alice
+put 2 bob
+put 3 carol
+put 4 dave
+
+delete 2
+
+# Same answer from the API.
+get 2
+
+# And at this instant the record is still on disk -- the deadline has not
+# passed yet. This matters: it shows the record really was written.
+leaked
+
+# Now let the deadline pass.
+tick 5
+
+# The record is physically gone.
+leaked
+find 2
+
+# What that cost.
+stats

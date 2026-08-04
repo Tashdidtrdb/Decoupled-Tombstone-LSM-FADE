@@ -61,13 +61,20 @@ class Result:
 		return self.compliance_bytes / self.compliance_compactions
 
 
-def run_engine(ops, mode=MODE_VANILLA, deadline=None, label=None, verify=False, **engine_kw):
+def run_engine(ops, mode=MODE_VANILLA, deadline=None, label=None, verify=False,
+		score_against=None, **engine_kw):
 	"""
 	Replay ops against one engine configuration.
 
 	verify=True checks every key against a reference dict at the end. Off by
 	default because it doubles runtime on large workloads, but worth enabling
 	whenever a new configuration is introduced.
+
+	score_against sets the deadline that violations are judged by, independently
+	of the deadline the engine was configured with. Vanilla runs with no deadline,
+	so scoring it against its own configuration would always report zero
+	violations by definition. Passing the comparison's deadline here measures what
+	lazy deletion actually costs against the same requirement.
 	"""
 	shutil.rmtree(DATA_DIR, ignore_errors=True)
 	stats = Stats()
@@ -104,7 +111,8 @@ def run_engine(ops, mode=MODE_VANILLA, deadline=None, label=None, verify=False, 
 			raise AssertionError(f"{label or mode}: {len(wrong)} keys incorrect")
 
 	unerased = _count_unerased(db, ops)
-	violations = _count_deadline_violations(db, ops, deadline)
+	violations = _count_deadline_violations(db, ops,
+		deadline if score_against is None else score_against)
 	live_bytes = sum(s.size_bytes for level in db.data_levels for s in level)
 	file_count = sum(len(level) for level in db.data_levels)
 	file_count += sum(len(level) for level in db.tombstone_levels)
@@ -185,8 +193,12 @@ def compare_modes(ops, deadline, labels=None, verify=False, **engine_kw):
 		(MODE_FADE, deadline, labels.get(MODE_FADE, f"FADE D={deadline}")),
 		(MODE_DECOUPLED, deadline, labels.get(MODE_DECOUPLED, f"Decoupled D={deadline}")),
 	]
+	# every mode is judged against the same deadline, including vanilla, which is
+	# not configured with one -- otherwise its violation count is zero by
+	# definition and the comparison hides the problem the project exists to solve
 	return [
-		run_engine(ops, mode=mode, deadline=dl, label=label, verify=verify, **engine_kw)
+		run_engine(ops, mode=mode, deadline=dl, label=label, verify=verify,
+			score_against=deadline, **engine_kw)
 		for mode, dl, label in configs
 	]
 

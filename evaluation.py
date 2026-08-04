@@ -67,8 +67,10 @@ def experiment_headline():
 		f"less compliance data than FADE")
 	print(f"  -> and runs {_saving(fade.compliance_compactions, decoupled.compliance_compactions)} "
 		f"fewer compliance compactions")
-	print(f"  -> both meet the deadline ({fade.violations} and {decoupled.violations} violations); "
-		f"Vanilla does no compliance work at all")
+	print(f"  -> both deadline modes meet it ({fade.violations} and "
+		f"{decoupled.violations} violations)")
+	print(f"  -> Vanilla does no compliance work, and misses the same deadline on "
+		f"{vanilla.violations} records")
 	print(f"  -> the cost: honouring a deadline leaves more, smaller files on disk")
 	print(f"     ({vanilla.file_count} -> {decoupled.file_count}), raising lookup I/O from "
 		f"{vanilla.avg_lookup_io:.2f} to {decoupled.avg_lookup_io:.2f} files per get")
@@ -91,10 +93,10 @@ def experiment_delete_ratio():
 			f"{fade.compliance_waf:.2f}",
 			f"{decoupled.compliance_waf:.2f}",
 			_saving(fade.compliance_bytes, decoupled.compliance_bytes),
-			f"{fade.violations}/{decoupled.violations}",
+			f"{vanilla.violations}/{fade.violations}/{decoupled.violations}",
 		])
 	print_table(rows, ["delete_ratio", "vanilla_WAF", "fade_complWAF",
-		"decoupled_complWAF", "saving", "violations F/D"])
+		"decoupled_complWAF", "saving", "violations V/F/D"])
 	print("\n  -> compliance cost rises with delete volume for both designs")
 	print("  -> the decoupled saving holds across the range")
 
@@ -116,10 +118,10 @@ def experiment_key_distribution():
 			f"{fade.compliance_waf:.2f}",
 			f"{decoupled.compliance_waf:.2f}",
 			_saving(fade.compliance_bytes, decoupled.compliance_bytes),
-			f"{fade.violations}/{decoupled.violations}",
+			f"{vanilla.violations}/{fade.violations}/{decoupled.violations}",
 		])
 	print_table(rows, ["distribution", "vanilla_WAF", "fade_complWAF",
-		"decoupled_complWAF", "saving", "violations F/D"])
+		"decoupled_complWAF", "saving", "violations V/F/D"])
 	print("\n  -> skewed deletes concentrate on few files, so both designs stay cheap")
 	print("  -> uniform deletes spread across the key space: FADE's range-based")
 	print("     selection pulls in files holding none of the deleted keys, which")
